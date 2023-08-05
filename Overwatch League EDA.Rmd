@@ -1,0 +1,441 @@
+---
+title: "Overwatch League Exploratory Analysis"
+author: "Mark Davison"
+output: pdf_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE)
+```
+```{r}
+library(tidyr)
+library(dplyr)
+library(pander)
+library(car)
+library(cowplot)
+library(pROC)
+library(MASS)
+library(ggplot2)
+```
+The purpose of this project is exploratory analysis of the Overwatch League. My aim is to find which variables are significant predictors of winning matches. This study with inform the variables I use building the final model of predicting the outcome of Overwatch League matches in another project. 
+
+
+## Necessary Domain Knowledge:
+
+The Overwatch league is an international Esports league ran and owned by Blizzard. The league is comprised of 19 city-based teams. The matches are formatted in best of 5 games. With each game being played on a unique map. The maps range from 1 to 4 rounds. In this project, I am only interested in the winners of maps and matches, not rounds.
+
+Each team consists of 5 players, each having unique roles. A tank, two damage dealing players, and two healing/support players.
+
+## Data
+
+I will be using two sets of data. "phs-2023/2022" and "watch_map_stats". The "phs" dataset are player statitistics, while "watch_map_stats" are the map statistics. The payer statistics include the predictor variables of the players performance, while the map statistics include the response variable (what I aim on predicting) the outcome of each match. The data is all sourced from the [Overwatch League statistics page](https://overwatchleague.com/en-us/statslab). 
+
+(Note, I am only using 2022 and 2023, as overwatch 2 was released in 2022, which came with significant balance changes, most notably changing the number of players in each team from 6 to 5, rendering all data pre 2022 useless here). \
+
+##Abstract
+The exploratory analysis found that variables  'Deaths,' 'Defensive_Assists,' 'Eliminations,' 'Hero_Damage_Done,' 'Objective_Time,' 'Recon_Assists,' 'Time_Alive', were the most significant of the predictors in the dataset at predicting the outcome of matches. This will be used to inform the building of another model that uses these variables in the context of a team vs team model, rather than player vs player. 
+
+I ran into some issues with multi-collinearity, as many variables record very similar things, primarily time based. After removing said variables, the predictive power of the model decreased very marginally, but the complexity was reduced significantly. My future study of this subject will be focused on the effect of these variables when modelled as a team.
+
+```{r}
+#loading player data and merging years
+owlplayer2023 <- read.csv("phs-2023.csv")
+owlplayer2022 <- read.csv("phs-2022.csv")
+owlplayermerge <- rbind(owlplayer2023, owlplayer2022)
+```
+
+```{r}
+#Loading map data
+owlmap <- read.csv("match_map_stats_000000000000.csv")
+```
+
+```{r}
+owlplayermerge[290:300,]
+```
+
+Looking at the player data, there are some glaring issues that need to be solved to make this data model ready. Specifically:\
+- The dataframe is currently in long format, meaning the variables we are interested in stat_name are in rows, while they need to be in columns. Also note that there are statistcs recorded for each individual character played. We will not be used individual character statistics, as it introduces complexity that is not likely to be significant, and it introduces more issues such as many character not being played often etc. I am therefore going to limit the statistics to all heroes only. 
+
+```{r}
+#filtering out characters statistics, as I am only interested in 'all heroes' statistics
+owlplayer1 <- owlplayermerge[owlplayermerge$hero_name == "All Heroes",]
+```
+
+```{r}
+#pivoting the dataframe from long to wide format
+owlpivot <- pivot_wider(owlplayer1, names_from=stat_name, values_from=amount)
+owlpivot[20:30]
+```
+
+This has successfully pivoted the dataframe, however many observations have recorded multiple values for each player for one map, and caused the columns to be formatted as lists.
+
+The 'Assist' column is the only variable that is required that has these multiple recorded values. We will select the first assist recorded for the variable:
+
+```{r}
+owlpivot$Assists[10:20]
+```
+
+As shown in this output, some observations have two values, while some only have one.
+
+```{r}
+#Loop that makes the list equal to the first value in the list.
+for(i in 1:nrow(owlpivot)){
+  if(length(owlpivot$Assists[[i]])>1){
+   owlpivot$Assists[[i]] <- owlpivot$Assists[[i]][1]
+  }
+}
+```
+
+```{r}
+owlpivot$Assists[10:20]
+```
+
+-   There are a number of redundant variables that need to be removed: ("Damage_Done" and "Hero_Damage_Done" are the exact same, damage_done will be removed. The same for "Objective_Contest_Time_Most_in_Game" and "Objective_Contest_Time")
+
+```{r}
+owlpivot[,c("Hero Wins", "Games Played Plus Won", "Games Won", "Assists - Most in Game", "Assists  - Avg per 10 min", "hero_name", "Damage_Done", "Objective_Contest_Time_Most_in_Game")] <- list(NULL)
+head(owlpivot)
+```
+
+-   The nested list columns need to be un-nested, and the NULL values need to be replaced with 0s
+
+```{r}
+owlplayer <- owlpivot %>%
+  unnest(everything()) %>%
+   mutate_all(~replace_na(., 0))
+
+#Also renaming the 'esports_match_id' variable to 'match_id' for simplicity
+names(owlplayer)[2] <- "match_id"
+head(owlplayer)
+```
+
+The *owlfinal* dataframe (which contains data of player statistics for each map) needs to be combined with the map dataframe (which contains data of each map played, including the winning team(our response variable)).
+
+First, I need to clean the map dataset:\
+- There are variables in this dataset that I am not interested in
+
+```{r}
+owlmap <- owlmap[,names(owlmap)[1:17]]
+head(owlmap)
+```
+
+The map dataframe now contains information for each round, for each map in each match.
+
+However we do not want observations for each round for each map, I am interested in the outcomes of each map, not each round. Meaning I need to group the round observations by map.
+```{r}
+#This creates a dataframe of the maximum round of each map for each map
+owl_max_round<- owlmap %>%
+  group_by(match_id, map_name) %>%
+  summarize(
+    max_map_round = max(map_round)
+)
+
+#This will then be used to inner join with the original map dataframe, resulting in only the last round in the map for each match.
+names(owl_max_round)[3] <- "map_round"
+owlmap <- inner_join(owlmap, owl_max_round, names(owl_max_round))
+head(owlmap)
+```
+
+Now the two dataframes need to be joined.
+```{r}
+#Loading packages and creating database connection
+library(DBI)
+library(RSQLite)
+conn <- dbConnect(SQLite(), "new_db.sqlite")
+```
+
+```{r}
+#Writing dataframes into tables in the database
+write.table(owlplayer, file="owlplayer.csv", sep=",", row.names=FALSE, col.names=TRUE)
+write.table(owlmap, file="owlmap.csv", sep=",", row.names=FALSE, col.names=TRUE)
+
+dbWriteTable(conn, "Players", owlplayer, overwrite=TRUE)
+dbWriteTable(conn, "Maps", owlmap, overwrite=TRUE)
+```
+
+```{r}
+#Joining tables with sql query and storing it in an R object
+owl <- dbGetQuery(conn, "SELECT *
+           FROM Players p JOIN Maps m
+           ON p.match_id = m.match_id AND p.map_name = m.map_name")
+dbDisconnect(conn)
+head(owl)
+```
+
+-  As stated in the brief, I am only interested in data after 05/05/2022 (start of Overwatch 2). Meaning I will need to format the dates into the correct format, as they are currently in the 'character' format. 
+
+The dates in this data set are formatted in two different ways for the 'round_end_time' variable,
+m/d/y and m/d/Y.
+I will convert both and then replace the correct dates with an index
+
+```{r}
+#index of dates that are m/d/y (not m/d/Y) using regular expression
+timeindex <- grepl("^\\d{2}/\\d{2}/\\d{2} \\d{2}:\\d{2}$", owl$round_end_time)
+
+timechange1 <- as.POSIXct(owl$round_end_time, format="%m/%d/%y %H:%M", tz="UTC")
+timechange2 <- as.POSIXct(owl$round_end_time, format="%m/%d/%Y %H:%M", tz="UTC")
+timechange1 <- na.omit(timechange1)
+timechange2 <- na.omit(timechange2)
+
+#Replacing the m/d/Y first, then m/d/y.
+owl$round_end_time <- timechange2
+owl$round_end_time[timeindex] <- timechange1
+```
+
+Now converting 'round_start_time' to a date: 
+```{r}
+owl$start_time <- as.POSIXct(owl$start_time, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+```
+
+```{r}
+#Filtering out observations before 05/05/2022 
+owl <- na.omit(owl[(owl$round_end_time > as.POSIXct("2022/05/05 01:00", tz="UTC")),])
+min(owl$round_end_time)
+```
+
+
+The 'round_start_time' variable from _owl_map_ is now redundant, as it is not the start time of the game, but the final round of that game. Instead I will use the start time variable from the player data when the dataframes are joined.
+
+```{r}
+owl[,"round_start_time"] <- list(NULL)
+```
+
+
+The player dataframe now contains all the information variables and most predictor variables I need to do analysis. But I still need to create a response variable that will be predicted by the model.
+
+```{r}
+#Loop that iterates through each row, and stores a value for the outcome of each map
+for(i in 1:nrow(owl)){
+  if(owl$map_winner[i]==owl$team_name[i]){
+    owl$win_map[i] <- 1
+  }else if(owl$map_winner[i]=="draw"){
+    owl$win_map[i] <- 2
+  }else{
+    owl$win_map[i] <- 0
+  }
+}
+
+#Loop that iterates through each row, and stores a value for the outcome of each match
+for(i in 1:nrow(owl)){
+  if(owl$match_winner[i]==owl$team_name[i]){
+    owl$win_match[i] <- 1
+  }else if(owl$match_winner[i]=="draw"){
+    owl$win_match[i] <- 2
+  }else{
+    owl$win_match[i] <- 0
+  }
+}
+```
+
+Joining the two dataframes has created two duplicate columns:
+
+```{r}
+names(owl)[duplicated(names(owl))]
+```
+
+Which will be removed:
+
+```{r}
+owl <- owl[, -c(49, 54)]
+```
+
+```{r}
+any(duplicated(names(owl)))
+```
+Some variable names need to have underscores placed between words to ensure they work with glm() function:
+```{r}
+#Placing underscores in each variable name
+owlrmv_ <- gsub(" ", "_", names(owl))
+names(owl) <- owlrmv_
+#Removing minus and underscore that some variables have
+owlrmv_minus <- gsub("_-", "", names(owl))
+names(owl) <- owlrmv_minus
+```
+
+
+To quickly check the validity of the data, I will check to make sure that there are 10 observations (one for each player) for a given map in a given match:
+
+```{r}
+nrow(owl[owl$match_id==41215 & owl$map_name=="Nepal",])
+```
+
+The data appears to have been cleaned correctly.
+
+Reordering columns for simplicity:
+```{r}
+owl <- owl[,c("start_time", "round_end_time", "match_id", "tournament_title", "map_type", "map_name", "player_name", "team_name", "All_Damage_Done", "Assists", "Average_Time_Alive", "Barrier_Damage_Done", "Damage_Quick_Melee", "Damage_Done", "Damage_Taken", "Deaths", "Defensive_Assists", "Eliminations", "Final_Blows", "Healing_Done", "Hero_Damage_Done", "Knockback_Kills", "Objective_Contest_Time", "Objective_Contest_Time_Avg_per_10_Min", "Objective_Contest_Time_Most_in_Game", "Objective_Kills", "Objective_Time", "Offensive_Assists", "Shots_Fired", "Time_Alive", "Time_Building_Ultimate", "Time_Elapsed_per_Ultimate_Earned", "Time_Holding_Ultimate", "Time_Played", "Ultimates_Earned_Fractional", "Ultimates_Used", "Weapon_Accuracy", "Melee_Final_Blows", "Melee_Percentage_of_Final_Blows", "Solo_Kills", "Damage_Blocked", "Environmental_Kills", "Environmental_Deaths", "Multikills", "Recon_Assists", "Turrets_Destroyed", "Teleporter_Pads_Destroyed", "stage", "game_number", "match_winner", "map_winner", "map_loser", "map_round", "winning_team_final_map_score", "losing_team_final_map_score", "control_round_name", "Attacker", "Defender", "team_one_name", "team_two_name", "win_map", "win_match")]
+names(owl)[1] <- "round_start_time"
+```
+
+
+#Exploratory analysis:
+```{r}
+elim_plot <- ggplot(owl, aes(x = factor(win_match), y = Eliminations)) +
+  geom_boxplot() +
+  labs(x = "Win Match",
+       y = "Eliminations") +
+  scale_x_discrete(labels = c("Loss", "Win")) +
+  theme_minimal()
+deaths_plot <- ggplot(owl, aes(x = factor(win_match), y = Deaths)) +
+  geom_boxplot() +
+  labs(x = "Win Match",
+       y = "Deaths") +
+  scale_x_discrete(labels = c("Loss", "Win")) +
+  theme_minimal()
+damage_plot <- ggplot(owl, aes(x = factor(win_match), y = Hero_Damage_Done)) +
+  geom_boxplot() +
+  labs(x = "Win Match",
+       y = "Hero Damage Done") +
+  scale_x_discrete(labels = c("Loss", "Win")) +
+  theme_minimal()
+healing_plot <- ggplot(owl, aes(x = factor(win_match), y = Time_Played)) +
+  geom_boxplot() +
+  labs(x = "Win Match",
+       y = "Healing Done") +
+  scale_x_discrete(labels = c("Loss", "Win")) +
+  theme_minimal()
+
+plot_grid(elim_plot, deaths_plot, damage_plot, healing_plot)
+```
+These boxplots illustrate some of the likely relationships in this dataset. Variable 'Eliminations' clealy has a positive correlation with winning. While 'Deaths' has a negative one. 
+
+Variable 'Hero_Damage_Done' appears to have a slight difference in win rate, while healing done doesn't appear to because of the significant amount of 0 values.
+
+This scatter plot better illustrates the relationship between 'Hero_Damage_Done' and winning. 
+```{r}
+ggplot(owl, aes(x = Hero_Damage_Done, y = win_match, color = factor(win_match))) +
+  geom_point() +
+  labs(y = "Healing Done",
+       x = "Hero Damage Done",
+       color = "Win Match") +
+  scale_color_discrete(name = "Win Match",
+                       labels = c("Loss", "Win")) 
+```
+
+
+#Model selection and evaluation
+
+## splitting into test and train set:
+```{r}
+set.seed(1)
+train <- sample(nrow(owl), nrow(owl)*0.7, replace=FALSE)
+train_owl <- owl[train,]
+test_owl <- owl[-train,]
+```
+
+
+##fitting full model:
+```{r}
+owl_logreg <- glm(win_match ~ All_Damage_Done + Assists + Average_Time_Alive + Barrier_Damage_Done + Damage_Quick_Melee + Damage_Taken + Deaths + Defensive_Assists + Eliminations + Final_Blows + Healing_Done + Hero_Damage_Done + Knockback_Kills + Objective_Contest_Time + Objective_Contest_Time_Avg_per_10_Min + Objective_Kills + Objective_Time + Offensive_Assists + Shots_Fired + Time_Alive + Time_Building_Ultimate + Time_Elapsed_per_Ultimate_Earned + Time_Holding_Ultimate + Time_Played + Ultimates_Earned_Fractional + Ultimates_Used + Weapon_Accuracy + Melee_Final_Blows + Melee_Percentage_of_Final_Blows + Solo_Kills + Damage_Blocked + Environmental_Kills + Environmental_Deaths + Multikills + Recon_Assists + Turrets_Destroyed + Teleporter_Pads_Destroyed, data = train_owl, family="binomial" )
+```
+
+```{r}
+summary(owl_logreg)
+```
+
+Evaluation metrics:
+```{r}
+threshold <- 0.5
+preds <- predict(owl_logreg, newdata = test_owl, type = "response")
+pred_labels <- ifelse(preds >= threshold, 1, 0)
+
+# AUC calculation
+auc <- roc(test_owl$win_match, preds)$auc
+
+# Classification accuracy
+acc <- mean(test_owl$win_match == pred_labels)
+
+# Precision
+precision <- sum(preds[test_owl$win_match == 1] >= threshold) / sum(preds >= threshold)
+
+# Recall
+recall <- sum(preds[test_owl$win_match == 1] >= threshold) / sum(test_owl$win_match == 1)
+
+cat(paste("AUC:", round(auc, 4), "\n"))
+cat(paste("Accuracy:", round(acc, 4), "\n"))
+cat(paste("Precision:", round(precision, 4), "\n"))
+cat(paste("Recall:", round(recall, 4), "\n"))
+```
+The full model appears to predict somewhat well. This full model likely has some highly correlated variables:
+
+```{r}
+pander(vif(owl_logreg))
+```
+There are some very heavily correlated variables in this dataset. This is likely because there are variables recording very similar things, or the same thing in a different way. For example 'Time_Alive' and 'Time_Building_Ultimate' both have unreasonably high VIF scores of 1865 and 373 respectively. This is likely because ultimates are constantly being built while players are playing the game. I will remove the least important predictor, rather than using regularization or PCA. I will remove variables based on the relative significance and my domain knowledge.
+
+Model with variables 'Time_Played', 'Objective_Contest_Time', 'Final_Blows', 'Time_Building_Ultimate', 'Ultimates_Earned_Fractional', 'All_Damage_Done' removed:
+```{r}
+owl_logreg_reduced <- glm(win_match ~  Assists + Average_Time_Alive + Barrier_Damage_Done + Damage_Quick_Melee + Damage_Taken + Deaths + Defensive_Assists + Eliminations + Healing_Done + Hero_Damage_Done + Knockback_Kills + Objective_Contest_Time_Avg_per_10_Min  + Objective_Time + Offensive_Assists + Shots_Fired  + Time_Elapsed_per_Ultimate_Earned + Time_Holding_Ultimate  + Ultimates_Used + Weapon_Accuracy + Melee_Final_Blows + Melee_Percentage_of_Final_Blows + Solo_Kills + Damage_Blocked + Environmental_Kills + Time_Alive + Environmental_Deaths + Multikills + Recon_Assists + Turrets_Destroyed + Teleporter_Pads_Destroyed  , data = train_owl, family="binomial" )
+```
+```{r}
+pander(vif(owl_logreg_reduced))
+```
+This signifcant correlations have been removed, as all variables are < 10.
+```{r}
+summary(owl_logreg_reduced)
+```
+
+```{r}
+threshold <- 0.5
+preds <- predict(owl_logreg_reduced, newdata = test_owl, type = "response")
+pred_labels <- ifelse(preds >= threshold, 1, 0)
+
+# AUC calculation
+auc <- roc(test_owl$win_match, preds)$auc
+
+# Classification accuracy
+acc <- mean(test_owl$win_match == pred_labels)
+
+# Precision
+precision <- sum(preds[test_owl$win_match == 1] >= threshold) / sum(preds >= threshold)
+
+# Recall
+recall <- sum(preds[test_owl$win_match == 1] >= threshold) / sum(test_owl$win_match == 1)
+
+cat(paste("AUC:", round(auc, 4), "\n"))
+cat(paste("Accuracy:", round(acc, 4), "\n"))
+cat(paste("Precision:", round(precision, 4), "\n"))
+cat(paste("Recall:", round(recall, 4), "\n"))
+```
+However the evaluation metrics show the model is marginally worse at predicting. 
+
+#Model selection 
+Now that the highly correlated varaibles have been removed, I will find the variables that appear to be the most informative.
+
+Performing forwards, backwards and stepwise model selection with both AIC and BIC.
+```{r, results='hide', warning=FALSE, message=FALSE}
+forward_modelaic <- stepAIC(owl_logreg_reduced, direction = "forward", scope = formula(owl_logreg_reduced))
+backward_modelaic <- stepAIC(owl_logreg_reduced, direction = "backward", scope = formula(owl_logreg_reduced))
+stepwise_modelaic <- stepAIC(owl_logreg_reduced, direction = "both", scope = formula(owl_logreg_reduced))
+
+forward_modelbic <- stepAIC(owl_logreg_reduced, direction = "forward", k = log(nrow(train_owl)), 
+                         scope = formula(owl_logreg_reduced))
+backward_modelbic <- stepAIC(owl_logreg_reduced, direction = "backward", k = log(nrow(train_owl)), 
+                          scope = formula(owl_logreg_reduced))
+stepwise_modelbic <- stepAIC(owl_logreg_reduced, direction = "both", k = log(nrow(train_owl)), 
+                          scope = formula(owl_logreg_reduced))
+```
+
+
+```{r}
+predictors <- c(all.vars(formula(stepwise_modelaic)), all.vars(formula(stepwise_modelbic)), all.vars(formula(forward_modelaic)),all.vars(formula(forward_modelbic)), all.vars(formula(backward_modelaic)), all.vars(formula(backward_modelbic)))
+```
+
+
+```{r}
+pred_freq <- table(predictors)
+
+
+# Plot the bar plot
+barplot(pred_freq, las = 2, col = "skyblue", main = "Variable Frequency", ylab = "Frequency")
+```
+This barplot illustrates the frequency of variables in all of the models selectd. Variables 'Deaths', 'Denfensive_Assits', 'Hero_Damge_Done', 'Objective_Time', 'Recon_Assits', 'Time_Alive' are included in all 6 models.
+```{r}
+pred_freq[pred_freq==max(pred_freq)]
+```
+These variables are therefore the most informative, and will be used for the future model. 
+
+Some variables not included here, such as 'Healing_Done' or 'Ultimates_Used' may be significant in the context of the future model predicting team vs team rather than individual players overall.
+
+This study was successful in getting a better understanding of the most informative variables in this context. This will help inform my further model building with this dataset. 
+
+
